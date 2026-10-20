@@ -1,6 +1,6 @@
 import pytest
 
-from model import Plant, reliability_ensemble, simulate, solar_output
+from model import MiningSystem, Terrain, reliability_ensemble, simulate, solar_output, specific_mining_energy
 
 
 def test_solar_output_is_bounded():
@@ -11,22 +11,22 @@ def test_simulation_is_reproducible():
     assert simulate(seed=4) == simulate(seed=4)
 
 
-def test_inventories_and_energy_are_nonnegative():
-    r = simulate(hours=120)
-    assert min(r.oxygen_kg, r.printed_parts_kg, r.unprocessed_regolith_kg,
-               r.energy_generated_kwh, r.energy_used_kwh) >= 0
+def test_mass_and_energy_are_nonnegative_and_conserved():
+    result = simulate(hours=160)
+    assert result.excavated_kg == pytest.approx(result.delivered_regolith_kg + result.unhauled_regolith_kg)
+    assert min(result.delivered_regolith_kg, result.energy_generated_kwh, result.energy_used_kwh) >= 0
 
 
-def test_energy_accounting_is_bounded_by_supply_and_initial_battery():
-    plant = Plant(battery_kwh=100)
-    r = simulate(hours=200, plant=plant)
-    assert r.energy_used_kwh <= r.energy_generated_kwh + plant.battery_kwh / 2 + 1e-9
+def test_harder_terrain_costs_more_energy_per_kg():
+    easy = specific_mining_energy(MiningSystem(), Terrain(slope_degrees=2, compaction_factor=0.9))
+    hard = specific_mining_energy(MiningSystem(), Terrain(slope_degrees=14, compaction_factor=1.5))
+    assert hard > easy
 
 
-def test_more_solar_increases_or_preserves_output():
-    low = simulate(hours=240, plant=Plant(solar_kw=16), seed=5)
-    high = simulate(hours=240, plant=Plant(solar_kw=45), seed=5)
-    assert high.earth_launch_displacement_kg >= low.earth_launch_displacement_kg
+def test_more_solar_does_not_reduce_delivered_output():
+    low = simulate(hours=240, system=MiningSystem(solar_kw=12), seed=5)
+    high = simulate(hours=240, system=MiningSystem(solar_kw=42), seed=5)
+    assert high.delivered_regolith_kg >= low.delivered_regolith_kg
 
 
 def test_invalid_horizon_rejected():
@@ -34,6 +34,6 @@ def test_invalid_horizon_rejected():
         simulate(hours=0)
 
 
-def test_reliability_ensemble_reports_quantiles():
+def test_reliability_ensemble_reports_ordered_quantiles():
     out = reliability_ensemble(draws=20, hours=100)
-    assert out["p10_displacement_kg"] <= out["mean_displacement_kg"] <= out["p90_displacement_kg"]
+    assert out["p10_delivered_kg"] <= out["mean_delivered_kg"] <= out["p90_delivered_kg"]

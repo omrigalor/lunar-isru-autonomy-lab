@@ -1,121 +1,144 @@
-"""Integrated lunar in-situ resource utilization scheduling simulator."""
+"""Energy- and reliability-constrained lunar regolith mining simulator."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 import json
 import math
 import random
 
 
 @dataclass(frozen=True)
-class Plant:
-    solar_kw: float = 32.0
-    battery_kwh: float = 180.0
-    excavator_kg_h: float = 16.0
-    electrolysis_kg_h: float = 7.0
-    printer_kg_h: float = 1.2
-    mining_kwh_kg: float = 0.12
-    electrolysis_kwh_kg: float = 2.2
-    printing_kwh_kg: float = 3.8
-
-
-@dataclass
-class Inventory:
-    raw_regolith_kg: float = 0.0
-    oxygen_kg: float = 0.0
-    metal_feedstock_kg: float = 0.0
-    printed_parts_kg: float = 0.0
-    battery_kwh: float = 90.0
+class MiningSystem:
+    solar_kw: float = 28.0
+    battery_kwh: float = 150.0
+    excavator_kg_h: float = 20.0
+    haul_payload_kg: float = 55.0
+    excavation_kwh_kg: float = 0.10
+    crusher_kwh_kg: float = 0.05
+    traverse_kwh_km: float = 0.85
+    one_way_haul_km: float = 1.4
+    wear_limit: float = 100.0
 
 
 @dataclass(frozen=True)
-class MissionResult:
-    oxygen_kg: float
-    printed_parts_kg: float
-    unprocessed_regolith_kg: float
+class Terrain:
+    slope_degrees: float = 7.0
+    compaction_factor: float = 1.15
+    boulder_probability_h: float = 0.025
+    dust_transmission_mean: float = 0.86
+
+
+@dataclass(frozen=True)
+class MiningResult:
+    excavated_kg: float
+    delivered_regolith_kg: float
+    unhauled_regolith_kg: float
     energy_generated_kwh: float
     energy_used_kwh: float
     curtailed_kwh: float
-    downtime_hours: int
-    earth_launch_displacement_kg: float
+    boulder_delay_hours: int
+    maintenance_hours: int
+    final_wear_index: float
+    delivered_kg_per_operating_hour: float
 
 
 def solar_output(hour: int, capacity_kw: float, dust_factor: float = 1.0) -> float:
-    """Illustrative half-sine daylight profile over a 29.5-day lunar cycle."""
+    """Illustrative half-sine daylight profile over a 708-hour lunar cycle."""
     phase = 2 * math.pi * ((hour + 90) % 708) / 708
     return capacity_kw * max(0.0, math.sin(phase)) * dust_factor
 
 
-def simulate(hours: int = 336, plant: Plant = Plant(), seed: int = 9,
-             autonomous_scheduler: bool = True) -> MissionResult:
-    if hours < 1 or min(asdict(plant).values()) <= 0:
-        raise ValueError("positive horizon and plant parameters are required")
+def specific_mining_energy(system: MiningSystem, terrain: Terrain) -> float:
+    """Energy per delivered kilogram, including excavation, crushing, and haul."""
+    slope_multiplier = 1.0 + 0.018 * max(0.0, terrain.slope_degrees)
+    dig = system.excavation_kwh_kg * terrain.compaction_factor * slope_multiplier
+    round_trip = 2 * system.one_way_haul_km * system.traverse_kwh_km
+    haul = round_trip / system.haul_payload_kg
+    return dig + system.crusher_kwh_kg + haul
+
+
+def simulate(hours: int = 336, system: MiningSystem = MiningSystem(),
+             terrain: Terrain = Terrain(), seed: int = 17) -> MiningResult:
+    if hours < 1:
+        raise ValueError("hours must be positive")
+    if min(asdict(system).values()) <= 0:
+        raise ValueError("mining-system parameters must be positive")
+    if terrain.slope_degrees < 0 or terrain.compaction_factor <= 0:
+        raise ValueError("terrain parameters are invalid")
+    if not 0 <= terrain.boulder_probability_h < 1:
+        raise ValueError("boulder probability must be in [0, 1)")
+
     rng = random.Random(seed)
-    inv = Inventory(battery_kwh=plant.battery_kwh / 2)
-    generated = used = curtailed = 0.0
-    downtime = 0
+    battery = system.battery_kwh / 2
+    stock = excavated = delivered = generated = used = curtailed = wear = 0.0
+    boulder_delay = maintenance = 0
+    energy_per_kg = specific_mining_energy(system, terrain)
+
     for hour in range(hours):
-        dust = max(.45, min(1.0, rng.gauss(.88, .07)))
-        available = solar_output(hour, plant.solar_kw, dust)
-        generated += available
-        # Rare common-mode outage; autonomy keeps reserves rather than consuming blindly.
-        failed = rng.random() < .018
-        if failed:
-            downtime += 1
-        reserve = .22 * plant.battery_kwh if autonomous_scheduler else 0.0
-        draw = max(0.0, inv.battery_kwh - reserve)
-        budget = available + draw
-        demand_used = 0.0
-        if not failed:
-            oxygen_target = 90 + hour * .08
-            parts_target = 18 + hour * .018
-            # Process existing stock before mining more material.
-            if inv.raw_regolith_kg > 0 and (inv.oxygen_kg < oxygen_target or not autonomous_scheduler):
-                process = min(plant.electrolysis_kg_h, inv.raw_regolith_kg,
-                              budget / plant.electrolysis_kwh_kg)
-                energy = process * plant.electrolysis_kwh_kg
-                inv.raw_regolith_kg -= process
-                inv.oxygen_kg += process * .42
-                inv.metal_feedstock_kg += process * .34
-                budget -= energy; demand_used += energy
-            if inv.metal_feedstock_kg > 0 and (inv.printed_parts_kg < parts_target or not autonomous_scheduler):
-                feed = min(plant.printer_kg_h, inv.metal_feedstock_kg,
-                           budget / plant.printing_kwh_kg)
-                energy = feed * plant.printing_kwh_kg
-                inv.metal_feedstock_kg -= feed
-                inv.printed_parts_kg += feed * .82
-                budget -= energy; demand_used += energy
-            stock_target = 35 if autonomous_scheduler else 120
-            if inv.raw_regolith_kg < stock_target:
-                mined = min(plant.excavator_kg_h, budget / plant.mining_kwh_kg)
-                energy = mined * plant.mining_kwh_kg
-                inv.raw_regolith_kg += mined
-                budget -= energy; demand_used += energy
-        solar_used = min(available, demand_used)
-        battery_used = max(0.0, demand_used - solar_used)
-        inv.battery_kwh = max(0.0, inv.battery_kwh - battery_used)
-        surplus = max(0.0, available - solar_used)
-        stored = min(surplus, plant.battery_kwh - inv.battery_kwh)
-        inv.battery_kwh += stored
+        dust = min(1.0, max(0.35, rng.gauss(terrain.dust_transmission_mean, 0.08)))
+        solar = solar_output(hour, system.solar_kw, dust)
+        generated += solar
+        reserve = 0.22 * system.battery_kwh
+        available = solar + max(0.0, battery - reserve)
+
+        if wear >= system.wear_limit:
+            maintenance += 1
+            wear *= 0.35
+            demand = 0.0
+        elif rng.random() < terrain.boulder_probability_h:
+            boulder_delay += 1
+            wear += 0.8
+            demand = 0.0
+        else:
+            thermal_phase = 2 * math.pi * (hour % 708) / 708
+            thermal_derating = 0.80 + 0.20 * (1 + math.cos(thermal_phase)) / 2
+            wear_derating = max(0.55, 1 - 0.004 * wear)
+            capacity = system.excavator_kg_h * thermal_derating * wear_derating
+            mined = min(capacity, available / energy_per_kg)
+            demand = mined * energy_per_kg
+            excavated += mined
+            stock += mined
+            wear += mined * (0.065 * terrain.compaction_factor)
+            deliverable = min(stock, system.haul_payload_kg)
+            delivered += deliverable
+            stock -= deliverable
+
+        solar_used = min(solar, demand)
+        battery = max(0.0, battery - max(0.0, demand - solar_used))
+        surplus = max(0.0, solar - solar_used)
+        stored = min(surplus, system.battery_kwh - battery)
+        battery += stored
         curtailed += surplus - stored
-        used += demand_used
-        if min(asdict(inv).values()) < -1e-9:
-            raise AssertionError("inventory conservation violated")
-    displacement = inv.oxygen_kg + inv.printed_parts_kg
-    return MissionResult(inv.oxygen_kg, inv.printed_parts_kg, inv.raw_regolith_kg,
-                         generated, used, curtailed, downtime, displacement)
+        used += demand
+
+    operating = max(1, hours - boulder_delay - maintenance)
+    return MiningResult(
+        excavated_kg=excavated,
+        delivered_regolith_kg=delivered,
+        unhauled_regolith_kg=stock,
+        energy_generated_kwh=generated,
+        energy_used_kwh=used,
+        curtailed_kwh=curtailed,
+        boulder_delay_hours=boulder_delay,
+        maintenance_hours=maintenance,
+        final_wear_index=wear,
+        delivered_kg_per_operating_hour=delivered / operating,
+    )
 
 
 def reliability_ensemble(draws: int = 200, hours: int = 336,
-                         plant: Plant = Plant(), seed: int = 9) -> dict[str, float]:
+                         system: MiningSystem = MiningSystem(),
+                         terrain: Terrain = Terrain(), seed: int = 17) -> dict[str, float]:
     if draws < 10:
         raise ValueError("use at least ten draws")
-    values = sorted(simulate(hours, plant, seed + i).earth_launch_displacement_kg
+    values = sorted(simulate(hours, system, terrain, seed + i).delivered_regolith_kg
                     for i in range(draws))
-    return {"mean_displacement_kg": sum(values) / draws,
-            "p10_displacement_kg": values[int(.1 * draws)],
-            "p90_displacement_kg": values[int(.9 * draws) - 1]}
+    return {
+        "mean_delivered_kg": sum(values) / draws,
+        "p10_delivered_kg": values[int(0.1 * draws)],
+        "p90_delivered_kg": values[min(draws - 1, int(0.9 * draws))],
+    }
 
 
 if __name__ == "__main__":
