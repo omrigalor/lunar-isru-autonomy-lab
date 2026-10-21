@@ -1,6 +1,8 @@
 import pytest
 
-from model import MiningSystem, Terrain, reliability_ensemble, simulate, solar_output, specific_mining_energy
+from model import (MiningSystem, RegolithSite, Terrain, adaptive_process_plan,
+                   leave_one_site_out_validation, reliability_ensemble, simulate,
+                   solar_output, specific_mining_energy)
 
 
 def test_solar_output_is_bounded():
@@ -37,3 +39,21 @@ def test_invalid_horizon_rejected():
 def test_reliability_ensemble_reports_ordered_quantiles():
     out = reliability_ensemble(draws=20, hours=100)
     assert out["p10_delivered_kg"] <= out["mean_delivered_kg"] <= out["p90_delivered_kg"]
+
+
+def test_composition_aware_process_selection_changes_by_site():
+    glassy = RegolithSite("glassy", .85, .2, .6, .2)
+    oxide_rich = RegolithSite("oxide", .2, .9, .6, .2)
+    assert adaptive_process_plan(glassy, 1000).process != adaptive_process_plan(oxide_rich, 1000).process
+
+
+def test_leave_one_site_out_validation_never_hides_adaptive_loss():
+    sites = [
+        RegolithSite("mare", .55, .75, .55, .3),
+        RegolithSite("highland", .78, .35, .72, .2),
+        RegolithSite("mixed", .42, .62, .88, .1),
+        RegolithSite("rough", .32, .48, .30, .5),
+    ]
+    results = leave_one_site_out_validation(sites)
+    assert len(results) == len(sites)
+    assert all(result["adaptive_gain"] >= -1e-12 for result in results)

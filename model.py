@@ -43,6 +43,43 @@ class MiningResult:
     delivered_kg_per_operating_hour: float
 
 
+@dataclass(frozen=True)
+class RegolithSite:
+    name: str
+    glass_fraction: float
+    metal_oxide_fraction: float
+    grain_uniformity: float
+    haul_km: float
+
+
+@dataclass(frozen=True)
+class FabricationProcess:
+    name: str
+    base_kwh_kg: float
+    imported_consumables_kg_per_kg: float
+    glass_weight: float
+    oxide_weight: float
+    uniformity_weight: float
+
+
+@dataclass(frozen=True)
+class FabricationPlan:
+    site: str
+    process: str
+    usable_print_mass_kg: float
+    energy_kwh: float
+    imported_consumables_kg: float
+    quality_score: float
+    objective: float
+
+
+PROCESSES = (
+    FabricationProcess("adaptive laser vitrification", 0.90, 0.0, 0.65, 0.15, 0.20),
+    FabricationProcess("pulsed electrical discharge", 0.72, 0.0, 0.25, 0.55, 0.20),
+    FabricationProcess("microwave sintering", 1.05, 0.0, 0.30, 0.30, 0.40),
+)
+
+
 def solar_output(hour: int, capacity_kw: float, dust_factor: float = 1.0) -> float:
     """Illustrative half-sine daylight profile over a 708-hour lunar cycle."""
     phase = 2 * math.pi * ((hour + 90) % 708) / 708
@@ -139,6 +176,71 @@ def reliability_ensemble(draws: int = 200, hours: int = 336,
         "p10_delivered_kg": values[int(0.1 * draws)],
         "p90_delivered_kg": values[min(draws - 1, int(0.9 * draws))],
     }
+
+
+def plan_local_fabrication(
+    site: RegolithSite,
+    delivered_regolith_kg: float,
+    process: FabricationProcess,
+) -> FabricationPlan:
+    """Score binder-free local printing after mining and short-haul penalties."""
+    if delivered_regolith_kg <= 0:
+        raise ValueError("delivered regolith must be positive")
+    composition_fit = (
+        process.glass_weight * site.glass_fraction
+        + process.oxide_weight * site.metal_oxide_fraction
+        + process.uniformity_weight * site.grain_uniformity
+    )
+    quality = min(1.0, max(0.0, 0.35 + 0.65 * composition_fit))
+    usable = delivered_regolith_kg * (0.58 + 0.37 * quality)
+    energy = usable * process.base_kwh_kg * (1.12 - 0.24 * composition_fit)
+    # Mine-near-print removes most haul energy; residual distance remains visible.
+    energy += usable * site.haul_km * 0.012
+    imports = usable * process.imported_consumables_kg_per_kg
+    objective = usable * quality / (energy + 35.0 * imports + 1e-9)
+    return FabricationPlan(site.name, process.name, usable, energy, imports, quality, objective)
+
+
+def adaptive_process_plan(
+    site: RegolithSite,
+    delivered_regolith_kg: float,
+    processes: tuple[FabricationProcess, ...] = PROCESSES,
+) -> FabricationPlan:
+    """Choose the lowest-energy, highest-quality process for local composition."""
+    return max(
+        (plan_local_fabrication(site, delivered_regolith_kg, process) for process in processes),
+        key=lambda plan: plan.objective,
+    )
+
+
+def leave_one_site_out_validation(
+    sites: list[RegolithSite], delivered_regolith_kg: float = 1000.0
+) -> list[dict[str, float | str]]:
+    """Validate process selection on each composition held out in turn."""
+    if len(sites) < 3:
+        raise ValueError("at least three sites are required")
+    results = []
+    for held_out in sites:
+        training = [site for site in sites if site != held_out]
+        process_scores = {
+            process: sum(
+                plan_local_fabrication(site, delivered_regolith_kg, process).objective
+                for site in training
+            ) / len(training)
+            for process in PROCESSES
+        }
+        fixed = max(process_scores, key=process_scores.get)
+        fixed_plan = plan_local_fabrication(held_out, delivered_regolith_kg, fixed)
+        adaptive = adaptive_process_plan(held_out, delivered_regolith_kg)
+        results.append({
+            "held_out_site": held_out.name,
+            "fixed_process": fixed.name,
+            "adaptive_process": adaptive.process,
+            "fixed_objective": fixed_plan.objective,
+            "adaptive_objective": adaptive.objective,
+            "adaptive_gain": adaptive.objective - fixed_plan.objective,
+        })
+    return results
 
 
 if __name__ == "__main__":
