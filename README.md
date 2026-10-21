@@ -1,4 +1,4 @@
-# Adaptive Lunar Regolith Mining & Additive Construction Digital Twin
+# Adaptive Lunar Regolith Mining & Additive Construction Systems Model
 
 A reliability-constrained model of lunar surface excavation and feedstock
 delivery. It connects terrain, digging energy, rover haul distance, solar power,
